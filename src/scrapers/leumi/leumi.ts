@@ -2,7 +2,7 @@ import moment, { type Moment } from 'moment';
 import { TimeoutError as PuppeteerTimeoutError, type Page } from 'puppeteer';
 import { SHEKEL_CURRENCY } from '../../constants';
 import { getDebug } from '../../helpers/debug';
-import { clickButton, fillInput, pageEvalAll, waitUntilElementFound } from '../../helpers/elements-interactions';
+import { clickButton, fillInput, waitUntilElementFound } from '../../helpers/elements-interactions';
 import { fetchGetWithinPage } from '../../helpers/fetch';
 import { getRawTransaction } from '../../helpers/transactions';
 import { waitForNavigation } from '../../helpers/navigation';
@@ -23,7 +23,7 @@ const DATE_FORMAT = 'DD.MM.YY';
 const ACCOUNT_BLOCKED_MSG = 'המנוי חסום';
 // Leumi rewords the middle of this message occasionally (שמסרת/שהוקלדו); require the stable prefix and the
 // "wrong" verdict so unrelated help text that mentions the identification details does not match.
-const INVALID_PASSWORD_PATTERN = 'אחד או יותר מפרטי ההזדהות\\s+\\S+\\s+שגויים';
+const INVALID_PASSWORD_PATTERN = 'אחד או יותר מפרטי ההזדהות(?:\\s+\\S+){0,2}\\s+שגויים';
 const LOGIN_WAIT_TIMEOUT = 60000;
 const CHANGE_PASSWORD_MODAL_SELECTOR = 'form input[name="newPwd"]';
 
@@ -63,12 +63,17 @@ interface SavingsAccountData {
   operationsListItems: any[];
 }
 
+// Direction marks and line breaks inside a message must not defeat matching.
+function normalizeText(text: string): string {
+  return text.replace(/[\u200e\u200f\u202a-\u202e]/g, '').replace(/\s+/g, ' ');
+}
+
 export function isInvalidPasswordText(text: string): boolean {
-  return new RegExp(INVALID_PASSWORD_PATTERN).test(text);
+  return new RegExp(INVALID_PASSWORD_PATTERN).test(normalizeText(text));
 }
 
 export function isAccountBlockedText(text: string): boolean {
-  return text.includes(ACCOUNT_BLOCKED_MSG);
+  return normalizeText(text).includes(ACCOUNT_BLOCKED_MSG);
 }
 
 // innerText skips hidden elements, so an error template that is not displayed does not count.
@@ -85,19 +90,35 @@ export function parseBalanceDisplay(value: unknown): number | undefined {
   if (typeof value !== 'string' && typeof value !== 'number') {
     throw new Error('unexpected BalanceDisplay format');
   }
-  const normalized = String(value).replace(/[\s\u200e\u200f\u20aa]/g, '');
+  // Drop the shekel sign and direction marks, read U+2212 as a minus; spaces are allowed only around the sign.
+  const normalized = String(value)
+    .replace(/[\u200e\u200f\u20aa]/g, '')
+    .replace(/\u2212/g, '-')
+    .trim();
   // Commas only as groups of three before the decimal point, so "1.234,56" is refused rather than misread.
-  const match = /^(-?)((?:\d{1,3}(?:,\d{3})+|\d+)(?:\.\d+)?)(-?)$/.exec(normalized);
+  const match = /^(-?)\s*((?:\d{1,3}(?:,\d{3})+|\d+)(?:\.\d+)?|\.\d+)\s*(-?)$/.exec(normalized);
   if (!match || (match[1] && match[3])) {
     throw new Error('unexpected BalanceDisplay format');
   }
   const amount = Number(match[2].replace(/,/g, ''));
+  if (!Number.isFinite(amount)) {
+    throw new Error('unexpected BalanceDisplay format');
+  }
   return match[1] || match[3] ? -amount : amount;
 }
 
 function getPossibleLoginResults() {
   const urls: LoginOptions['possibleResults'] = {
     [LoginResults.Success]: [/ebanking\/SO\/SPA.aspx/i],
+    // Checked before the password error: a final failed attempt can leave both messages on the page.
+    [LoginResults.AccountBlocked]: [
+      async options => {
+        if (!options || !options.page) {
+          throw new Error('missing page options argument');
+        }
+        return isAccountBlockedText(await getVisibleText(options.page));
+      },
+    ],
     [LoginResults.InvalidPassword]: [
       async options => {
         if (!options || !options.page) {
@@ -106,21 +127,6 @@ function getPossibleLoginResults() {
         // The svg#Capa_1 icon anchor no longer exists on the redesigned
         // logon page; detect the failure message in the visible page text.
         return isInvalidPasswordText(await getVisibleText(options.page));
-      },
-    ],
-    [LoginResults.AccountBlocked]: [
-      // NOTICE - might not be relevant starting the Leumi re-design during 2022 Sep
-      async options => {
-        if (!options || !options.page) {
-          throw new Error('missing page options argument');
-        }
-        const errorMessage = await pageEvalAll(options.page, '.errHeader', '', label => {
-          return (label[0] as HTMLElement)?.innerText;
-        });
-
-        return (
-          !!errorMessage?.startsWith(ACCOUNT_BLOCKED_MSG) || isAccountBlockedText(await getVisibleText(options.page))
-        );
       },
     ],
     [LoginResults.ChangePassword]: [
@@ -194,7 +200,7 @@ function removeSpecialCharacters(str: string): string {
   return str.replace(/[^0-9/-]/g, '');
 }
 
-async function fetchTransactionsForAccount(
+export async function fetchTransactionsForAccount(
   page: Page,
   startDate: Moment,
   accountId: string,
@@ -391,7 +397,10 @@ export async function waitForPostLogin(page: Page): Promise<void> {
       waitUntilElementFound(page, 'div.main-content', false, LOGIN_WAIT_TIMEOUT),
       page.waitForFunction(
         (pattern: string, blocked: string) => {
-          const text = document.body?.innerText ?? '';
+          // Same normalization as normalizeText(); this callback runs in the page.
+          const text = (document.body?.innerText ?? '')
+            .replace(/[\u200e\u200f\u202a-\u202e]/g, '')
+            .replace(/\s+/g, ' ');
           return new RegExp(pattern).test(text) || text.includes(blocked);
         },
         { timeout: LOGIN_WAIT_TIMEOUT },

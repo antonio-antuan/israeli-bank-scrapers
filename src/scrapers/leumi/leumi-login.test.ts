@@ -4,7 +4,9 @@ import { BaseScraper } from '../base-scraper';
 import { BaseScraperWithBrowser, LoginResults } from '../base-scraper-with-browser';
 import { ScraperErrorTypes } from '../errors';
 import { type ScraperOptions } from '../interface';
-import {
+import moment from 'moment';
+import LeumiScraper, {
+  fetchTransactionsForAccount,
   isAccountBlockedText,
   isInvalidPasswordText,
   navigateToLogin,
@@ -25,6 +27,12 @@ describe('isInvalidPasswordText', () => {
     expect(isInvalidPasswordText('שגיאה\nאחד או יותר מפרטי ההזדהות שהוקלדו שגויים, ניתן לנסות שוב')).toBe(true);
   });
 
+  test('tolerates line breaks, direction marks and no or two words before the verdict', () => {
+    expect(isInvalidPasswordText('אחד או יותר\nמפרטי\u200f ההזדהות שמסרת שגויים')).toBe(true);
+    expect(isInvalidPasswordText('אחד או יותר מפרטי ההזדהות שגויים')).toBe(true);
+    expect(isInvalidPasswordText('אחד או יותר מפרטי ההזדהות אשר הוקלדו שגויים')).toBe(true);
+  });
+
   test('does not match help text that only mentions the identification details', () => {
     expect(isInvalidPasswordText('אחד או יותר מפרטי ההזדהות נדרשים לכניסה לחשבון')).toBe(false);
   });
@@ -33,6 +41,10 @@ describe('isInvalidPasswordText', () => {
 describe('isAccountBlockedText', () => {
   test('matches the blocked subscription notice', () => {
     expect(isAccountBlockedText('המנוי חסום. יש לפנות לסניף')).toBe(true);
+  });
+
+  test('tolerates a line break inside the notice', () => {
+    expect(isAccountBlockedText('המנוי\nחסום')).toBe(true);
   });
 
   test('does not match an ordinary page', () => {
@@ -57,6 +69,17 @@ describe('parseBalanceDisplay', () => {
     expect(parseBalanceDisplay('‎₪ 1,234.56')).toBe(1234.56);
   });
 
+  test('reads a Unicode minus on either side', () => {
+    expect(parseBalanceDisplay('\u221212.50')).toBe(-12.5);
+    expect(parseBalanceDisplay('12.50\u2212')).toBe(-12.5);
+  });
+
+  test('reads zero, integers and a leading-dot fraction', () => {
+    expect(parseBalanceDisplay('0')).toBe(0);
+    expect(parseBalanceDisplay('1,234')).toBe(1234);
+    expect(parseBalanceDisplay('.5')).toBe(0.5);
+  });
+
   test('accepts a number', () => {
     expect(parseBalanceDisplay(42.5)).toBe(42.5);
   });
@@ -66,7 +89,7 @@ describe('parseBalanceDisplay', () => {
     expect(parseBalanceDisplay('')).toBeUndefined();
   });
 
-  test.each(['abc', '1.234,56', '12,34', '--5', '-5-', '1 2 3x'])('refuses %p', value => {
+  test.each(['abc', '1.234,56', '12,34', '--5', '-5-', '1 2 3', '1 2 3x', '9'.repeat(400)])('refuses %p', value => {
     expect(() => parseBalanceDisplay(value)).toThrow('unexpected BalanceDisplay format');
   });
 
@@ -103,6 +126,84 @@ describe('waitForPostLogin', () => {
       expect.any(String),
       expect.any(String),
     ]);
+  });
+});
+
+describe('login result order', () => {
+  const results = () =>
+    new LeumiScraper(options).getLoginOptions({ username: 'u', password: 'p' }).possibleResults as Record<
+      string,
+      ((o: { page: Page }) => Promise<boolean>)[]
+    >;
+  const classify = async (text: string) => {
+    const page = {
+      evaluate: jest.fn().mockResolvedValue(text),
+      $: jest.fn().mockResolvedValue(null),
+    } as unknown as Page;
+    for (const [result, checks] of Object.entries(results())) {
+      for (const check of checks) {
+        if (typeof check === 'function' && (await check({ page }))) {
+          return result;
+        }
+      }
+    }
+    return undefined;
+  };
+
+  test('a blocked notice wins over a password error left on the page', async () => {
+    await expect(classify('אחד או יותר מפרטי ההזדהות שמסרת שגויים\nהמנוי חסום')).resolves.toBe(
+      LoginResults.AccountBlocked,
+    );
+  });
+
+  test('a password error alone is reported as such', async () => {
+    await expect(classify('אחד או יותר מפרטי ההזדהות שהוקלדו שגויים')).resolves.toBe(LoginResults.InvalidPassword);
+  });
+});
+
+describe('fetchTransactionsForAccount', () => {
+  afterEach(() => jest.useRealTimers());
+
+  test('catches a filter response that arrives while the click is still in flight', async () => {
+    jest.useFakeTimers();
+    const response = {
+      url: () =>
+        'https://hb2.bankleumi.co.il/ChannelWCF/Broker.svc/ProcessRequest?moduleName=UC_SO_27_GetBusinessAccountTrx',
+      request: () => ({ method: () => 'POST' }),
+      json: () =>
+        Promise.resolve({
+          jsonResp: JSON.stringify({
+            BalanceDisplay: '1,234.56',
+            TodayTransactionsItems: [],
+            HistoryTransactionsItems: [],
+          }),
+        }),
+    };
+    let listener: ((r: typeof response) => boolean) | undefined;
+    let deliver: ((r: typeof response) => void) | undefined;
+    const page = {
+      waitForSelector: jest.fn().mockResolvedValue({}),
+      focus: jest.fn().mockResolvedValue(undefined),
+      type: jest.fn().mockResolvedValue(undefined),
+      $eval: jest.fn((selector: string) => {
+        // The response is emitted during the filter click; only a listener that already exists sees it.
+        if (selector === "button[aria-label='סנן']" && listener?.(response)) {
+          deliver?.(response);
+        }
+        return Promise.resolve();
+      }),
+      waitForResponse: jest.fn(
+        (predicate: (r: typeof response) => boolean) =>
+          new Promise((resolve, reject) => {
+            listener = predicate;
+            deliver = resolve;
+            setTimeout(() => reject(new PuppeteerTimeoutError('no response')), 30000);
+          }),
+      ),
+    };
+    const result = fetchTransactionsForAccount(page as unknown as Page, moment('2026-01-01'), '123-456789/01', options);
+    await jest.advanceTimersByTimeAsync(31000);
+    await expect(result).resolves.toEqual(expect.objectContaining({ balance: 1234.56, txns: [] }));
   });
 });
 
