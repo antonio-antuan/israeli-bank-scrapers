@@ -290,16 +290,21 @@ class BaseScraperWithBrowser<TCredentials extends ScraperCredentials> extends Ba
     debug(`terminating browser with success = ${_success}`);
     this.emitProgress(ScraperProgressTypes.Terminating);
 
-    if (!_success && !!this.options.storeFailureScreenShotPath) {
-      debug(`create a snapshot before terminated in ${this.options.storeFailureScreenShotPath}`);
-      await this.page.screenshot({
-        path: this.options.storeFailureScreenShotPath,
-        fullPage: true,
-      });
+    try {
+      if (!_success && !!this.options.storeFailureScreenShotPath) {
+        debug(`create a snapshot before terminated in ${this.options.storeFailureScreenShotPath}`);
+        // Best effort: a failed screenshot must not skip closing the browser or replace the original error.
+        await this.page
+          .screenshot({
+            path: this.options.storeFailureScreenShotPath,
+            fullPage: true,
+          })
+          .catch(e => debug(`failed to store the failure screenshot: ${(e as Error).message}`));
+      }
+    } finally {
+      await Promise.all(this.cleanups.reverse().map(safeCleanup));
+      this.cleanups = [];
     }
-
-    await Promise.all(this.cleanups.reverse().map(safeCleanup));
-    this.cleanups = [];
   }
 
   private handleLoginResult(loginResult: LoginResults) {
@@ -316,6 +321,13 @@ class BaseScraperWithBrowser<TCredentials extends ScraperCredentials> extends Ba
             loginResult === LoginResults.InvalidPassword
               ? ScraperErrorTypes.InvalidPassword
               : ScraperErrorTypes.General,
+          errorMessage: `Login failed with ${loginResult} error`,
+        };
+      case LoginResults.AccountBlocked:
+        this.emitProgress(ScraperProgressTypes.LoginFailed);
+        return {
+          success: false,
+          errorType: ScraperErrorTypes.AccountBlocked,
           errorMessage: `Login failed with ${loginResult} error`,
         };
       case LoginResults.ChangePassword:

@@ -1,6 +1,7 @@
 import { EventEmitter } from 'events';
 import moment from 'moment-timezone';
 import { type CompanyTypes, ScraperProgressTypes } from '../definitions';
+import { TimeoutError as PuppeteerTimeoutError } from 'puppeteer';
 import { TimeoutError } from '../helpers/waiting';
 import { createGenericError, createTimeoutError } from './errors';
 import {
@@ -14,6 +15,11 @@ import {
 } from './interface';
 
 const SCRAPE_PROGRESS = 'SCRAPE_PROGRESS';
+
+// Puppeteer's own waits throw its TimeoutError, not the helper's; both are timeouts to the caller.
+function isTimeoutError(e: unknown): boolean {
+  return e instanceof TimeoutError || e instanceof PuppeteerTimeoutError;
+}
 
 export class BaseScraper<TCredentials extends ScraperCredentials> implements Scraper<TCredentials> {
   private eventEmitter = new EventEmitter();
@@ -34,8 +40,9 @@ export class BaseScraper<TCredentials extends ScraperCredentials> implements Scr
     try {
       loginResult = await this.login(credentials);
     } catch (e) {
-      loginResult =
-        e instanceof TimeoutError ? createTimeoutError((e as Error).message) : createGenericError((e as Error).message);
+      loginResult = isTimeoutError(e)
+        ? createTimeoutError((e as Error).message)
+        : createGenericError((e as Error).message);
     }
 
     let scrapeResult;
@@ -43,10 +50,9 @@ export class BaseScraper<TCredentials extends ScraperCredentials> implements Scr
       try {
         scrapeResult = await this.fetchData();
       } catch (e) {
-        scrapeResult =
-          e instanceof TimeoutError
-            ? createTimeoutError((e as Error).message)
-            : createGenericError((e as Error).message);
+        scrapeResult = isTimeoutError(e)
+          ? createTimeoutError((e as Error).message)
+          : createGenericError((e as Error).message);
       }
     } else {
       scrapeResult = loginResult;
