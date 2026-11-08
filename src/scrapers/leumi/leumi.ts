@@ -26,6 +26,10 @@ const ACCOUNT_BLOCKED_MSG = 'המנוי חסום';
 const INVALID_PASSWORD_PATTERN = 'אחד או יותר מפרטי ההזדהות(?:\\s+\\S+){0,2}\\s+שגויים';
 const LOGIN_WAIT_TIMEOUT = 60000;
 const CHANGE_PASSWORD_MODAL_SELECTOR = 'form input[name="newPwd"]';
+// Leumi lands a login on one of several home page variants (the old skip link, div.main-content, or the
+// HPSummary page with neither). Every logged-in eBanking page carries the logout button, so it is the stable sign.
+const LOGGED_IN_PATH_PATTERN = '^/ebanking/';
+const LOGOUT_TEXT = 'התנתקות';
 
 interface SavingsDepositItem {
   index: string;
@@ -408,9 +412,32 @@ export async function waitForPostLogin(page: Page): Promise<void> {
         ACCOUNT_BLOCKED_MSG,
       ),
       waitUntilElementFound(page, CHANGE_PASSWORD_MODAL_SELECTOR, true, LOGIN_WAIT_TIMEOUT),
+      page.waitForFunction(
+        (pathPattern: string, logout: string) =>
+          new RegExp(pathPattern, 'i').test(window.location.pathname) &&
+          (document.body?.innerText ?? '').includes(logout),
+        { timeout: LOGIN_WAIT_TIMEOUT },
+        LOGGED_IN_PATH_PATTERN,
+        LOGOUT_TEXT,
+      ),
     ]);
   } catch (e) {
-    throw e instanceof AggregateError ? e.errors[0] : e;
+    const first = e instanceof AggregateError ? e.errors[0] : e;
+    if (first instanceof PuppeteerTimeoutError) {
+      // Name the page that was not recognized, so the next variant is visible in the error message.
+      throw new PuppeteerTimeoutError(`no known post-login page at ${pageRoute(page.url())}`);
+    }
+    throw first;
+  }
+}
+
+// The path and hash route of a URL without query strings, restricted to plain characters.
+export function pageRoute(url: string): string {
+  try {
+    const { pathname, hash } = new URL(url);
+    return `${pathname}${hash.split('?')[0]}`.replace(/[^A-Za-z0-9/._#-]/g, '').slice(0, 200);
+  } catch {
+    return 'an unparsable URL';
   }
 }
 
