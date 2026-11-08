@@ -10,6 +10,7 @@ import LeumiScraper, {
   isAccountBlockedText,
   isInvalidPasswordText,
   navigateToLogin,
+  pageRoute,
   parseBalanceDisplay,
   waitForPostLogin,
 } from './leumi';
@@ -98,6 +99,26 @@ describe('parseBalanceDisplay', () => {
   });
 });
 
+const HOME = 'https://hb2.bankleumi.co.il/eBanking/SO/SPA.aspx#/HPSummary';
+
+describe('pageRoute', () => {
+  test('keeps the path and hash route', () => {
+    expect(pageRoute('https://hb2.bankleumi.co.il/eBanking/SO/SPA.aspx#/ts/CardsWorld')).toBe(
+      '/eBanking/SO/SPA.aspx#/ts/CardsWorld',
+    );
+  });
+
+  test('drops query strings and unexpected characters', () => {
+    expect(pageRoute('https://hb2.bankleumi.co.il/eBanking/a b.aspx?u=1#/x"<y>?WidgetPar=1')).toBe(
+      '/eBanking/a20b.aspx#/x223Cy3E',
+    );
+  });
+
+  test('survives a URL it cannot parse', () => {
+    expect(pageRoute('not a url')).toBe('an unparsable URL');
+  });
+});
+
 describe('waitForPostLogin', () => {
   const timeout = () => Promise.reject(new PuppeteerTimeoutError('timed out'));
 
@@ -110,22 +131,86 @@ describe('waitForPostLogin', () => {
   });
 
   test('rethrows a timeout as a timeout when every branch fails', async () => {
-    const page = { waitForSelector: jest.fn(timeout), waitForFunction: jest.fn(timeout) };
+    const page = { waitForSelector: jest.fn(timeout), waitForFunction: jest.fn(timeout), url: () => HOME };
     await expect(waitForPostLogin(page as unknown as Page)).rejects.toBeInstanceOf(PuppeteerTimeoutError);
   });
 
+  test('names the unrecognized page route without its query string', async () => {
+    const page = {
+      waitForSelector: jest.fn(timeout),
+      waitForFunction: jest.fn(timeout),
+      url: () => 'https://hb2.bankleumi.co.il/eBanking/SO/SPA.aspx?sid=secret#/HPSummary?x=1',
+    };
+    await expect(waitForPostLogin(page as unknown as Page)).rejects.toThrow(
+      'no known post-login page at /eBanking/SO/SPA.aspx#/HPSummary',
+    );
+  });
+
+  test('a non-timeout failure is rethrown unchanged', async () => {
+    const boom = new Error('target closed');
+    const page = {
+      waitForSelector: jest.fn(() => Promise.reject(boom)),
+      waitForFunction: jest.fn(() => Promise.reject(boom)),
+      url: () => HOME,
+    };
+    await expect(waitForPostLogin(page as unknown as Page)).rejects.toBe(boom);
+  });
+
+  test('the logout button alone is enough on the HPSummary variant', async () => {
+    const page = {
+      waitForSelector: jest.fn(timeout),
+      waitForFunction: jest.fn(),
+      url: () => HOME,
+    };
+    page.waitForFunction.mockImplementationOnce(timeout).mockImplementationOnce(() => Promise.resolve());
+    await expect(waitForPostLogin(page as unknown as Page)).resolves.toBeUndefined();
+  });
+
+  describe('the logged-in check that runs in the page', () => {
+    const globals = globalThis as unknown as Record<string, unknown>;
+    afterEach(() => {
+      delete globals.window;
+      delete globals.document;
+    });
+
+    const loggedInCheck = async () => {
+      const page = { waitForSelector: jest.fn(timeout), waitForFunction: jest.fn(timeout), url: () => HOME };
+      await waitForPostLogin(page as unknown as Page).catch(() => undefined);
+      const [check, , ...args] = page.waitForFunction.mock.calls[1] as unknown as [
+        (...a: string[]) => boolean,
+        unknown,
+        ...string[],
+      ];
+      return (pathname: string, text: string) => {
+        globals.window = { location: { pathname } };
+        globals.document = { body: { innerText: text } };
+        return check(...args);
+      };
+    };
+
+    test('accepts an eBanking page with the logout button', async () => {
+      const check = await loggedInCheck();
+      expect(check('/eBanking/SO/SPA.aspx', 'בוקר טוב\nהתנתקות')).toBe(true);
+      expect(check('/eBanking/ForeignCurrency/DisplayForeignAccountsActivity.aspx', 'התנתקות')).toBe(true);
+    });
+
+    test('refuses the logon page and a page without the logout button', async () => {
+      const check = await loggedInCheck();
+      expect(check('/authenticate/logon', 'התנתקות')).toBe(false);
+      expect(check('/eBanking/SO/SPA.aspx', 'טוען...')).toBe(false);
+    });
+  });
+
   test('gives every branch the same 60 second deadline', async () => {
-    const page = { waitForSelector: jest.fn(timeout), waitForFunction: jest.fn(timeout) };
+    const page = { waitForSelector: jest.fn(timeout), waitForFunction: jest.fn(timeout), url: () => HOME };
     await waitForPostLogin(page as unknown as Page).catch(() => undefined);
     for (const [, selectorOptions] of page.waitForSelector.mock.calls as unknown as [string, { timeout: number }][]) {
       expect(selectorOptions.timeout).toBe(60000);
     }
-    expect(page.waitForFunction.mock.calls[0]).toEqual([
-      expect.any(Function),
-      { timeout: 60000 },
-      expect.any(String),
-      expect.any(String),
-    ]);
+    expect(page.waitForFunction).toHaveBeenCalledTimes(2);
+    for (const call of page.waitForFunction.mock.calls as unknown[][]) {
+      expect(call).toEqual([expect.any(Function), { timeout: 60000 }, expect.any(String), expect.any(String)]);
+    }
   });
 });
 
